@@ -1,10 +1,32 @@
+use std::sync::Arc;
 use thiserror::Error;
 
-#[derive(Debug, Error)]
-pub enum LsmError {
+#[derive(Debug, Error, Clone)]
+pub enum DbError {
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(Arc<std::io::Error>),
 
     #[error("Key not found: {0}")]
     KeyNotFound(String),
+
+    #[error("Directory not found: {0}")]
+    DirectoryNotFound(String),
+
+    #[error("Manifest not found")]
+    ManifestNotFound,
+
+    #[error("Manifest is corrupted")]
+    ManifestCorrupted,
+
+    #[error("Writer panic. Operation aborted.")]
+    WriterPanic,
+
+    #[error("Data corrupted: {0}")]
+    DataCorrupted(String),
+}
+
+impl From<std::io::Error> for DbError {
+    fn from(err: std::io::Error) -> Self {
+        DbError::Io(std::sync::Arc::new(err))
+    }
 }
