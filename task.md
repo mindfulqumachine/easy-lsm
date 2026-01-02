@@ -7,10 +7,10 @@ Tasks:
     a. [x] Refactor Manifest discovery logic (recover_or_init).
     b. [x] Refactor Db::new to use unified recovery flow.
     c. [x] Implement LSN consistency checks.
-[] 3. Memtable size check and freeze
-    a. check if a memtable has reached the max size.
-    b. if so, freeze it and start a new memtable.
-    c. update the manifest.
+[x] 3. Memtable size check and freeze
+    a. check if a memtable has reached the max size in write_req's write_states::LeaderWritingMemtable state.
+    b. if so, freeze it and start a new memtable with the corresponding wal.
+    c. update the manifest with the new items and persist to disk.
 [] 4. Implement the sstable logic
     a. the structure on disk.
     b. loading the sstable's index and bloom filter to disk only.

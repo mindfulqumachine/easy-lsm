@@ -26,11 +26,12 @@ pub mod state {
 #[derive(Debug)]
 pub(crate) struct Memtable<State> {
     // The primary storage for keys and values.
-    store: SkipMap<Key, Value>,
+    // Wrapped in Arc for cheap cloning during freeze.
+    store: Arc<SkipMap<Key, Value>>,
 
     // Use atomic for size tracking to avoid &mut requirement if we want concurrent reads/size checks?
     // put_batch takes &self because SkipMap handles concurrency.
-    size_bytes: AtomicUsize,
+    size_bytes: Arc<AtomicUsize>,
     state: PhantomData<State>,
 }
 
@@ -38,8 +39,8 @@ impl Memtable<state::Mutable> {
     /// Creates a new mutable memtable.
     pub fn new() -> Memtable<state::Mutable> {
         Self {
-            store: SkipMap::new(),
-            size_bytes: AtomicUsize::new(0),
+            store: Arc::new(SkipMap::new()),
+            size_bytes: Arc::new(AtomicUsize::new(0)),
             state: PhantomData,
         }
     }
@@ -73,12 +74,25 @@ impl Memtable<state::Mutable> {
         self.store.insert(key, value);
     }
 
+    pub fn size(&self) -> usize {
+        self.size_bytes.load(Ordering::Relaxed)
+    }
+
     /// Freezes the memtable, preventing further writes.
     #[allow(dead_code)]
     pub fn freeze(self) -> Memtable<state::Immutable> {
         Memtable {
-            store: self.store,
-            size_bytes: self.size_bytes,
+            store: self.store.clone(),
+            size_bytes: self.size_bytes.clone(),
+            state: PhantomData,
+        }
+    }
+
+    /// Creates an immutable wrapper around the current memtable data.
+    pub fn freeze_from_ref(&self) -> Memtable<state::Immutable> {
+        Memtable {
+            store: self.store.clone(),
+            size_bytes: self.size_bytes.clone(),
             state: PhantomData,
         }
     }

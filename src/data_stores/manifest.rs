@@ -149,7 +149,7 @@ impl Manifest {
         // We use Wal::create_at to ensure correct naming and initialization.
         // We drop the resulting Wal object because Db::new will re-open it as part of startup.
         use crate::data_stores::wal::Wal;
-        let wal = Wal::create_at(db_dir, wal_id)?;
+        let wal = Wal::<crate::data_stores::wal::wal_states::Writable>::open(db_dir, wal_id)?;
 
         // Create manifest with the ID of the WAL we just created.
         let m = Manifest::new(wal.id);
@@ -176,6 +176,28 @@ impl Manifest {
             .get_mut()
             .sync_all()
             .map_err(|e| DbError::Io(Arc::new(e)))?;
+        Ok(())
+    }
+
+    /// Returns the next available WAL ID.
+    pub(crate) fn next_wal_id(&self) -> u32 {
+        self.next_file_id
+    }
+
+    /// Commits the new WAL ID to the manifest and persists.
+    /// This should be called AFTER the WAL file is successfully created on disk.
+    /// We require the `Wal` reference as proof that it has been created.
+    pub(crate) fn commit_new_wal(
+        &mut self,
+        wal: &crate::data_stores::wal::Wal<crate::data_stores::wal::wal_states::Writable>,
+        base_dir: &str,
+    ) -> Result<(), DbError> {
+        if wal.id != self.next_file_id {
+            return Err(DbError::DataCorrupted("WAL ID mismatch".to_string()));
+        }
+        self.next_file_id += 1;
+        self.wals.push(wal.id);
+        self.write_to_disk(base_dir)?;
         Ok(())
     }
 }

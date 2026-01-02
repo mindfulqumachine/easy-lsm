@@ -26,6 +26,9 @@ pub enum DbError {
 
     #[error("Data corrupted: {0}")]
     DataCorrupted(String),
+
+    #[error("Unimplemented: {0}")]
+    Unimplemented(String),
 }
 
 impl From<std::io::Error> for DbError {

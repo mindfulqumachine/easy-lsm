@@ -492,6 +492,18 @@ impl<'a>
     > {
         // We pass the receipt to prove we wrote to WAL.
         db.write_memtable(self.state.0.reqs.clone(), self.state.2)?;
+
+        // Check if memtable is full and needs rotation.
+        if db.active_memtable_size() >= crate::MAX_MEMTABLE_SIZE {
+            db.rotate_memtable().map_err(|e| {
+                // If rotation fails, we should probably log it but not fail the write request itself
+                // because the write request succeeded (in WAL and Memtable).
+                // However, failing here might be safer to stop the world?
+                // For now, let's propagate error as it might indicate disk issues (manifest write).
+                e
+            })?;
+        }
+
         Ok(Writer {
             req: self.req,
             state: write_states::LeaderFinishingWrite(self.state.0),

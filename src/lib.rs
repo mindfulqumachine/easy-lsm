@@ -21,6 +21,8 @@ use crate::{
 
 pub use data_stores::value::Value;
 
+pub const MAX_MEMTABLE_SIZE: usize = 4 * 1024 * 1024; // 4MB
+
 mod data_stores;
 mod err;
 mod write_req;
@@ -91,26 +93,13 @@ pub struct Db<State> {
     //  and it is time to freeze the memtable and add a new one.
     manifest_lock: Mutex<Manifest>,
 
+    // The directory where the database is stored.
+    db_dir: PathBuf,
+
     state: PhantomData<State>,
 }
 
 impl<State> Db<State> {
-    /// Creates a new database instance and make it available for read-write operations.
-    ///
-    /// Initializing the database determines if this is a pristine start - at a new
-    /// directory, or a start from a previous state.
-    /// The manifest is the key here. The database looks for the most upto date and valid
-    /// manifest. manifests have the .mf extension and the ELSM magic word as the first
-    /// 4 bytes. Then there is the checksum which validates data integrity.
-    /// If the DB finds an invalid manifest, it stops and asks user to delete that
-    /// before starting again.
-    ///
-    /// After locating it, the DB will load it. The manifest is the ensamble of everything
-    /// that makes this database work - the write-ahead-log, helps us construct the
-    /// memtables - active and frozen. Then it has the list of sstables.
-    ///
-    /// Only when the database has constructed its full state, it moves from read-only to
-    /// read-write state and becomes available for business.
     /// Creates a new database instance and make it available for read-write operations.
     ///
     /// Initializing the database determines if this is a pristine start - at a new
@@ -156,6 +145,7 @@ impl<State> Db<State> {
             wal_cv: Condvar::new(),
             mem_cv: Condvar::new(),
             manifest_lock: Mutex::new(manifest),
+            db_dir: path.to_path_buf(),
             state: PhantomData,
         })
     }
@@ -197,7 +187,7 @@ impl<State> Db<State> {
         let version = DbVersion {
             next_lsn: 0,
             mutable_memtable: Arc::new(Memtable::new()),
-            mutable_wal: crate::data_stores::wal::Wal::<wal_states::Writable>::create_at(
+            mutable_wal: crate::data_stores::wal::Wal::<wal_states::Writable>::open(
                 std::path::Path::new("/tmp"),
                 0,
             )
@@ -212,6 +202,7 @@ impl<State> Db<State> {
             wal_cv: Condvar::new(),
             mem_cv: Condvar::new(),
             manifest_lock: Mutex::new(Manifest::new(0)),
+            db_dir: PathBuf::from("/tmp"),
             state: PhantomData,
         }
     }
@@ -278,6 +269,106 @@ impl Db<db_states::ReadWrite> {
         memtable.put_batch(&reqs);
         Ok(())
     }
+
+    pub(crate) fn active_memtable_size(&self) -> usize {
+        self.current.load().mutable_memtable.size()
+    }
+
+    /// Rotates the memtable:
+    /// 1. Adds a new WAL to manifest (persisting it).
+    /// 2. Creates the new WAL file.
+    /// 3. Freezes current memtable.
+    /// 4. Creates new mutable memtable.
+    /// 5. Updates DbVersion.
+    pub(crate) fn rotate_memtable(&self) -> Result<(), err::DbError> {
+        let mut manifest_guard = self.manifest_lock.lock().unwrap();
+
+        // We need the db directory. Since we don't store it in Db directly,
+        // we can derive it from the current WAL path or add it to Db.
+        // For now, let's look at how we get paths.
+        // The WAL has a path, but the Wal struct might not expose the base directory easily without parsing.
+        // Let's rely on the fact that existing WALs are in the DB directory.
+        // HACK: We need the base directory.
+        // Let's modify Db to store `db_dir` or extract it.
+        // For this step, I will assume we can get it from the internal state or pass it around.
+        // Wait, `Db::new` has `db_dir`. We should probably store it in `Db`.
+
+        // But to avoid blocking this tool call with a structural change that needs a separate tool call,
+        // let's try to infer it? No, that's brittle.
+        // Let's proceed with adding the methods, but `rotate_memtable` will need `db_dir`.
+        // I'll make `rotate_memtable` take `db_dir`? No, `Writer` calls it and `Writer` doesn't know `db_dir`.
+        // So `Db` MUST store `db_dir`.
+
+        // I will return an error here placeholder and fixing `Db` struct in next step.
+        // Actually, I should update `Db` struct first.
+
+        // Let's just implement the logic assuming `self.db_dir` exists, and I will add the field in the next tool call.
+        // 1. Get next WAL ID (do not modify manifest yet)
+        let new_wal_id = manifest_guard.next_wal_id();
+
+        // 2. Create new WAL file on disk.
+        // If this fails, the manifest is untouched, and we just have a missing file (clean state).
+        // DbVersion needs the OPEN WAL.
+        // We get a wal object back, which serves as proof of creation.
+        let new_wal =
+            crate::data_stores::wal::Wal::<wal_states::Writable>::open(&self.db_dir, new_wal_id)?;
+
+        // 3. Commit new WAL to manifest (Persist)
+        // Now that the file exists, we can safely point the manifest to it.
+        // If this fails, we have an orphaned WAL file but the DB state is consistent (checked next startup).
+        manifest_guard.commit_new_wal(
+            &new_wal,
+            self.db_dir.to_str().ok_or(err::DbError::DirectoryNotFound(
+                "Invalid db_dir path".to_string(),
+            ))?,
+        )?;
+
+        // 4. Update DbVersion
+        // Atomic swap of the version.
+        // We need to move the current mutable memtable to frozen.
+        // And replace mutable memtable with new one.
+        // And replace mutable wal with new one.
+
+        let current = self.current.load();
+        // But `Memtable` is `Arc<SkipMap>` inside.
+        // So `freeze` should take `&self` and return new `Memtable<Immutable>`?
+        // OR `freeze` consumes `self`.
+        // If `mutable_memtable` is `Arc`, I can't consume it if others have references.
+        // But `DbVersion` is `Arc`, and `mutable_memtable` is `Arc`.
+        // Others might be holding `Arc<DbVersion>` and thus `Arc<Memtable>`.
+        // So I cannot consume `Memtable`.
+        // I must change `freeze` to take `&self` and return `Memtable<Immutable>`.
+        // I'll update Memtable::freeze in a separate step or assume I did it.
+        // Wait, I updated `freeze` to take `self` but return new struct with cloned `Arc`.
+        // But I can't call `self` method on `Arc`.
+        // I need `freeze` to take `&self`.
+
+        // Let's assume I fix `freeze` to take `&self` in next step.
+        // Freeze the current mutable memtable.
+        // We use freeze_from_ref to get a new Memtable<Immutable> sharing the same underlying data (Arc<SkipMap>).
+        let mut frozen_memtables = current.frozen_memtables.clone();
+        let frozen = current.mutable_memtable.freeze_from_ref();
+        frozen_memtables.push(Arc::new(frozen));
+
+        let new_version = DbVersion {
+            next_lsn: current.next_lsn, // LSN is managed by WriteSyncs, DbVersion copy might be stale or just snapshot.
+            // Actually `next_lsn` in DbVersion seems unused for coordination?
+            // WriteSyncs has `next_lsn`.
+            // DbVersion `next_lsn` is probably "next LSN to be written to this version"?
+            // It's used in `recover_state` to init `WriteSyncs`.
+            // In running system, `WriteSyncs` governs LSN.
+            // So we just copy it or update it?
+            // Let's copy it.
+            mutable_memtable: Arc::new(Memtable::new()),
+            mutable_wal: new_wal,
+            frozen_memtables,
+            sstables: current.sstables.clone(),
+        };
+
+        self.current.store(Arc::new(new_version));
+
+        Ok(())
+    }
 }
 
 fn recover_state(
@@ -310,7 +401,7 @@ fn recover_state(
     let frozen_memtables = frozen_results?;
     let (mutable_memtable, max_lsn) = mutable_res?;
 
-    let mutable_wal = Wal::<wal_states::Writable>::create_at(db_dir, mutable_wal_id)?;
+    let mutable_wal = Wal::<wal_states::Writable>::open(db_dir, mutable_wal_id)?;
     Ok(RecoveredState {
         mutable_memtable: Arc::new(mutable_memtable),
         mutable_wal,
@@ -434,7 +525,7 @@ mod tests {
             next_lsn: current_guard.next_lsn,
             mutable_memtable: current_guard.mutable_memtable.clone(),
             frozen_memtables: vec![frozen_mem],
-            mutable_wal: Wal::<wal_states::Writable>::create_at(std::path::Path::new("/tmp"), 999)
+            mutable_wal: Wal::<wal_states::Writable>::open(std::path::Path::new("/tmp"), 999)
                 .unwrap(),
             sstables: Vec::new(),
         };
@@ -454,6 +545,58 @@ mod tests {
         match val {
             Some(Value::Bytes(b)) => assert_eq!(&*b, b"val_active"),
             _ => panic!("Should get active value"),
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_memtable_rotation() {
+        // Use tempfile for isolation
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            Db::<db_states::ReadWrite>::new(dir.path().to_str().unwrap()).expect("Db new failed");
+
+        // 1. Write enough data to trigger rotation
+        // MAX_MEMTABLE_SIZE is 4MB.
+        // We need to write > 4MB.
+        // Let's make a large value.
+        let large_val_size = 1024 * 1024; // 1MB
+        let val_bytes = vec![0u8; large_val_size];
+        let val = Value::new(&val_bytes);
+
+        // 5 writes should exceed 4MB
+        for i in 0..5 {
+            db.put(format!("key{}", i).as_bytes(), val.clone()).unwrap();
+        }
+
+        // 2. Verification
+        let current = db.current.load();
+
+        // Should have at least 1 frozen memtable
+        assert!(
+            !current.frozen_memtables.is_empty(),
+            "Should have frozen memtables"
+        );
+
+        // Mutable memtable should be relatively small (fresh)
+        assert!(
+            current.mutable_memtable.size() < 2 * 1024 * 1024,
+            "New mutable memtable should be small"
+        );
+
+        // 3. Verify data persistence and recovery
+        // Drop db to close headers/files? (Not strict in this mock, but good practice)
+        drop(db);
+
+        // Reopen
+        let db = Db::<db_states::ReadWrite>::new(dir.path().to_str().unwrap()).unwrap();
+
+        // Check keys
+        for i in 0..5 {
+            let key = format!("key{}", i);
+            let res = db.get(key.as_bytes()).unwrap();
+            assert!(res.is_some(), "Key {} should exist", key);
         }
 
         fs::remove_dir_all(&dir).unwrap();

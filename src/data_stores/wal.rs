@@ -10,6 +10,7 @@ use std::{
 };
 
 pub(crate) const WAL_EXTENSION: &str = ".wal";
+pub(crate) const WAL_MAGIC: u32 = 0xCAFE_BABE;
 
 #[derive(Debug)]
 pub struct Wal<S = Writable> {
@@ -80,13 +81,44 @@ impl<'a> std::io::Write for HasherWriter<'a> {
 }
 
 impl Wal<Writable> {
-    pub(crate) fn create_at(base_dir: &std::path::Path, wal_id: u32) -> Result<Self, DbError> {
+    /// Opens a WAL file.
+    /// If the file does not exist, it is created and initialized with the magic number.
+    /// If it exists, it is verified against the magic number and opened for appending.
+    pub fn open(base_dir: &std::path::Path, wal_id: u32) -> Result<Self, DbError> {
         let path = base_dir.join(format!("{:05}{WAL_EXTENSION}", wal_id));
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
             .create(true)
             .append(true)
             .open(&path)
             .map_err(|e| DbError::Io(Arc::new(e)))?;
+
+        let len = file.metadata().map_err(|e| DbError::Io(Arc::new(e)))?.len();
+
+        if len == 0 {
+            // New file: Write Magic
+            file.write_all(&WAL_MAGIC.to_le_bytes())
+                .map_err(|e| DbError::Io(Arc::new(e)))?;
+            file.sync_all().map_err(|e| DbError::Io(Arc::new(e)))?;
+        } else {
+            // Existing file: Validate Magic
+            let mut magic_buf = [0u8; std::mem::size_of_val(&WAL_MAGIC)];
+            {
+                use std::io::{Read, Seek};
+                file.seek(std::io::SeekFrom::Start(0))
+                    .map_err(|e| DbError::Io(Arc::new(e)))?;
+                file.read_exact(&mut magic_buf)
+                    .map_err(|e| DbError::Io(Arc::new(e)))?;
+            }
+            let magic = u32::from_le_bytes(magic_buf);
+            if magic != WAL_MAGIC {
+                return Err(DbError::DataCorrupted(
+                    "Invalid WAL Magic in mutable WAL".to_string(),
+                ));
+            }
+        }
+
         Ok(Self {
             state: Writable {
                 file: Arc::new(Mutex::new(BufWriter::new(file))),
@@ -130,11 +162,22 @@ impl Wal<ReadOnly> {
         // we assume single threaded iteration per WAL instance).
         // Actually, with `BufReader`, we read sequentially.
         // If we clone the File, we get a new struct `File` but same underlying description.
-        let file = self
+        let mut file = self
             .state
             .file
             .try_clone()
             .map_err(|e| DbError::Io(Arc::new(e)))?;
+
+        // Validate Magic
+        let mut magic_buf = [0u8; std::mem::size_of_val(&WAL_MAGIC)];
+        use std::io::Read;
+        file.read_exact(&mut magic_buf)
+            .map_err(|e| DbError::Io(Arc::new(e)))?;
+        let magic = u32::from_le_bytes(magic_buf);
+        if magic != WAL_MAGIC {
+            return Err(DbError::DataCorrupted("Invalid WAL Magic".to_string()));
+        }
+
         Ok(WalIterator {
             reader: std::io::BufReader::new(file),
         })
@@ -259,7 +302,7 @@ mod tests {
         let v1 = Value::new(b"value1");
 
         {
-            let wal = Wal::<Writable>::create_at(dir.path(), 1).unwrap();
+            let wal = Wal::<Writable>::open(dir.path(), 1).unwrap();
             let mut writer = wal.lock();
             Wal::<Writable>::encode_entry(&mut *writer, &k1, &v1).unwrap();
         }
@@ -288,7 +331,7 @@ mod tests {
 
         // Write valid entry
         {
-            let wal = Wal::<Writable>::create_at(dir.path(), 2).unwrap();
+            let wal = Wal::<Writable>::open(dir.path(), 2).unwrap();
             let mut writer = wal.lock();
             Wal::<Writable>::encode_entry(&mut *writer, &k1, &v1).unwrap();
         }
@@ -325,7 +368,7 @@ mod tests {
         let v1 = Value::new(b"value1");
 
         {
-            let wal = Wal::<Writable>::create_at(dir.path(), 3).unwrap();
+            let wal = Wal::<Writable>::open(dir.path(), 3).unwrap();
             let mut writer = wal.lock();
             Wal::<Writable>::encode_entry(&mut *writer, &k1, &v1).unwrap();
         }
@@ -369,7 +412,7 @@ mod tests {
         let v1 = Value::new(b"value1");
 
         {
-            let wal = Wal::<Writable>::create_at(dir.path(), 4).unwrap();
+            let wal = Wal::<Writable>::open(dir.path(), 4).unwrap();
             let mut writer = wal.lock();
             Wal::<Writable>::encode_entry(&mut *writer, &k1, &v1).unwrap();
         }
@@ -401,14 +444,14 @@ mod tests {
         let v1 = Value::new(b"val1");
 
         {
-            let wal = Wal::<Writable>::create_at(dir.path(), 5).unwrap();
+            let wal = Wal::<Writable>::open(dir.path(), 5).unwrap();
             let mut writer = wal.lock();
             Wal::<Writable>::encode_entry(&mut *writer, &k1, &v1).unwrap();
         }
 
         // Re-open as writable (append mode simulation)
         {
-            let wal = Wal::<Writable>::create_at(dir.path(), 5).unwrap();
+            let wal = Wal::<Writable>::open(dir.path(), 5).unwrap();
             let k2 = Key::new(b"key2", 102);
             let v2 = Value::new(b"val2");
             let mut writer = wal.lock();
