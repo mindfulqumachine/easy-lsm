@@ -37,10 +37,9 @@ pub(crate) struct DbVersion {
     next_lsn: LsnType,
 
     mutable_memtable: Arc<Memtable<state::Mutable>>,
-    mutable_wal: Wal<wal::Writable>,
-
     frozen_memtables: Vec<Arc<Memtable<state::Immutable>>>,
 
+    mutable_wal: Wal<wal::Writable>,
     sstables: Vec<Vec<Arc<Sstable>>>,
 }
 
@@ -76,7 +75,7 @@ impl WriteSyncs {
 }
 
 pub struct Db<State> {
-    current: ArcSwap<DbVersion>,
+    pub(crate) current: ArcSwap<DbVersion>,
 
     // control plane mechanisms to orchestrate the writes.
     pub(crate) write_sync: Arc<Mutex<WriteSyncs>>,
@@ -138,7 +137,7 @@ impl<State> Db<State> {
         let manifest = Manifest::recover_or_init(path)?;
 
         // 2. Recovery
-        let state = Self::recover_state(path, &manifest)?;
+        let state = recover_state(path, &manifest)?;
 
         // 3. Launch
         let version = DbVersion {
@@ -161,71 +160,26 @@ impl<State> Db<State> {
         })
     }
 
-    fn recover_state(
-        db_dir: &std::path::Path,
-        manifest: &Manifest,
-    ) -> Result<RecoveredState, err::DbError> {
-        if manifest.wals.is_empty() {
-            return Err(err::DbError::DataCorrupted(
-                "Manifest contains no WALs".to_string(),
-            ));
+    /// Get a value from the active memtable.
+    /// TODO: This should also check frozen memtables and SSTables.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Value>, err::DbError> {
+        let current_version = self.current.load();
+        let memtable = &current_version.mutable_memtable;
+
+        if let Some(val) = memtable.get(key) {
+            return Ok(Some(val));
         }
 
-        let mutable_wal_idx = manifest.wals.len() - 1;
-        let mutable_wal_id = manifest.wals[mutable_wal_idx];
-
-        let wal_path = |wal_id| db_dir.join(format!("{:05}{}", wal_id, wal::WAL_EXTENSION));
-
-        let mutable_wal_path = wal_path(mutable_wal_id);
-
-        let (frozen_results, mutable_res) = rayon::join(
-            || {
-                manifest.wals[..mutable_wal_idx]
-                    .par_iter()
-                    .map(|&wal_id| Self::replay_immutable_wal(wal_path(wal_id)))
-                    .collect::<Result<Vec<_>, err::DbError>>()
-            },
-            || Self::replay_mutable_wal(mutable_wal_path),
-        );
-
-        let frozen_memtables = frozen_results?;
-        let (mutable_memtable, max_lsn) = mutable_res?;
-
-        let mutable_wal = Wal::<wal_states::Writable>::create_at(db_dir, mutable_wal_id)?;
-        Ok(RecoveredState {
-            mutable_memtable: Arc::new(mutable_memtable),
-            mutable_wal,
-            frozen_memtables,
-            next_lsn: max_lsn + 1,
-        })
-    }
-
-    fn replay_immutable_wal(
-        wal_path: PathBuf,
-    ) -> Result<Arc<Memtable<state::Immutable>>, err::DbError> {
-        let wal = Wal::<wal::ReadOnly>::open(wal_path)?;
-        let memtable = Memtable::new();
-        for entry_res in wal.try_iter()? {
-            let (key, value) = entry_res?;
-            memtable.recover(key, value);
+        // Iterate over frozen memtables in reverse order (newest to oldest)
+        for memtable in current_version.frozen_memtables.iter().rev() {
+            if let Some(val) = memtable.get(key) {
+                return Ok(Some(val));
+            }
         }
-        Ok(Arc::new(memtable.freeze()))
-    }
 
-    fn replay_mutable_wal(
-        wal_path: PathBuf,
-    ) -> Result<(Memtable<state::Mutable>, u64), err::DbError> {
-        let wal = Wal::<wal::ReadOnly>::open(wal_path)?;
+        // TODO: Check SSTables once implemented.
 
-        let memtable = Memtable::new();
-
-        let mut last_lsn = 0;
-        for entry_res in wal.try_iter()? {
-            let (key, value) = entry_res?;
-            last_lsn = key.lsn.load(std::sync::atomic::Ordering::Relaxed);
-            memtable.recover(key, value);
-        }
-        Ok((memtable, last_lsn))
+        Ok(None)
     }
 
     #[cfg(test)]
@@ -324,14 +278,71 @@ impl Db<db_states::ReadWrite> {
         memtable.put_batch(&reqs);
         Ok(())
     }
+}
 
-    /// Get a value from the active memtable.
-    /// TODO: This should also check frozen memtables and SSTables.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Value>, err::DbError> {
-        let current_version = self.current.load();
-        let memtable = &current_version.mutable_memtable;
-        Ok(memtable.get(key))
+fn recover_state(
+    db_dir: &std::path::Path,
+    manifest: &Manifest,
+) -> Result<RecoveredState, err::DbError> {
+    if manifest.wals.is_empty() {
+        return Err(err::DbError::DataCorrupted(
+            "Manifest contains no WALs".to_string(),
+        ));
     }
+
+    let mutable_wal_idx = manifest.wals.len() - 1;
+    let mutable_wal_id = manifest.wals[mutable_wal_idx];
+
+    let wal_path = |wal_id| db_dir.join(format!("{:05}{}", wal_id, wal::WAL_EXTENSION));
+
+    let mutable_wal_path = wal_path(mutable_wal_id);
+
+    let (frozen_results, mutable_res) = rayon::join(
+        || {
+            manifest.wals[..mutable_wal_idx]
+                .par_iter()
+                .map(|&wal_id| replay_immutable_wal(wal_path(wal_id)))
+                .collect::<Result<Vec<_>, err::DbError>>()
+        },
+        || replay_mutable_wal(mutable_wal_path),
+    );
+
+    let frozen_memtables = frozen_results?;
+    let (mutable_memtable, max_lsn) = mutable_res?;
+
+    let mutable_wal = Wal::<wal_states::Writable>::create_at(db_dir, mutable_wal_id)?;
+    Ok(RecoveredState {
+        mutable_memtable: Arc::new(mutable_memtable),
+        mutable_wal,
+        frozen_memtables,
+        next_lsn: max_lsn + 1,
+    })
+}
+
+fn replay_immutable_wal(
+    wal_path: PathBuf,
+) -> Result<Arc<Memtable<state::Immutable>>, err::DbError> {
+    let wal = Wal::<wal::ReadOnly>::open(wal_path)?;
+    let memtable = Memtable::new();
+    for entry_res in wal.try_iter()? {
+        let (key, value) = entry_res?;
+        memtable.recover(key, value);
+    }
+    Ok(Arc::new(memtable.freeze()))
+}
+
+fn replay_mutable_wal(wal_path: PathBuf) -> Result<(Memtable<state::Mutable>, u64), err::DbError> {
+    let wal = Wal::<wal::ReadOnly>::open(wal_path)?;
+
+    let memtable = Memtable::new();
+
+    let mut last_lsn = 0;
+    for entry_res in wal.try_iter()? {
+        let (key, value) = entry_res?;
+        last_lsn = key.lsn.load(std::sync::atomic::Ordering::Relaxed);
+        memtable.recover(key, value);
+    }
+    Ok((memtable, last_lsn))
 }
 
 #[cfg(test)]
@@ -395,6 +406,54 @@ mod tests {
                 Some(Value::Bytes(b)) => assert_eq!(&*b, b"val2"),
                 _ => panic!("Failed to recover key2"),
             }
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_get_from_frozen() {
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join("test_get_from_frozen");
+        if dir.exists() {
+            fs::remove_dir_all(&dir).unwrap();
+        }
+        fs::create_dir(&dir).unwrap();
+
+        let db = Db::<db_states::ReadWrite>::new_test();
+
+        // 1. Create a memtable, put some data, and freeze it
+        let frozen_mem = Arc::new(Memtable::new());
+        frozen_mem.recover(Key::new(b"key_frozen", 100), Value::new(b"val_frozen"));
+        let frozen_mem = Arc::new(Arc::try_unwrap(frozen_mem).unwrap().freeze());
+
+        // 2. Inject it into DB
+        let current_guard = db.current.load();
+        let new_version = DbVersion {
+            next_lsn: current_guard.next_lsn,
+            mutable_memtable: current_guard.mutable_memtable.clone(),
+            frozen_memtables: vec![frozen_mem],
+            mutable_wal: Wal::<wal_states::Writable>::create_at(std::path::Path::new("/tmp"), 999)
+                .unwrap(),
+            sstables: Vec::new(),
+        };
+        db.current.store(Arc::new(new_version));
+
+        // 3. Test get
+        let val = db.get(b"key_frozen").unwrap();
+        match val {
+            Some(Value::Bytes(b)) => assert_eq!(&*b, b"val_frozen"),
+            _ => panic!("Failed to get key from frozen memtable"),
+        }
+
+        // 4. Test precedence (Mutable > Frozen)
+        db.put(b"key_frozen", Value::new(b"val_active")).unwrap();
+
+        let val = db.get(b"key_frozen").unwrap();
+        match val {
+            Some(Value::Bytes(b)) => assert_eq!(&*b, b"val_active"),
+            _ => panic!("Should get active value"),
         }
 
         fs::remove_dir_all(&dir).unwrap();

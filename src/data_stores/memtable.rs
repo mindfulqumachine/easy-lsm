@@ -10,8 +10,10 @@ use crate::write_req::WriteRequest;
 
 pub mod state {
     /// Designator for an active memtable.
+    #[derive(Debug)]
     pub struct Mutable;
     /// This memtable is frozen and does not accept writes.
+    #[derive(Debug)]
     pub struct Immutable;
 }
 
@@ -21,6 +23,7 @@ pub mod state {
 /// N:  Total allowed size for the memtable in bytes.
 /// K: Key type. Must implement Ord for the inherent ordering requirements of the LSM tree.
 /// V: Value type.
+#[derive(Debug)]
 pub(crate) struct Memtable<State> {
     // The primary storage for keys and values.
     store: SkipMap<Key, Value>,
@@ -106,6 +109,13 @@ impl<State> Memtable<State> {
         let end = Key::new(key_bytes, 0);
 
         // range is (Bound<T>, Bound<T>)
+        // The range method on a skip-list does notiterate through the
+        // the theoritical gap between start and end. It finds the first
+        // actual item matching the start bound and then iterates only
+        // through the actual items present. because we call next() immediate,
+        // it is guarantted to only return the latest version of the key with
+        // O(log N) time complexity where N being the total number of keys in
+        // memtable.
         let range = self.store.range(start..=end);
 
         // Get the first entry (latest version)
@@ -113,6 +123,9 @@ impl<State> Memtable<State> {
             let val = entry.value();
             match val {
                 Value::Tombstone => None,
+                // Large value types are wrapped in Arc.
+                // Str(Arc<str>), Bytes(Arc<Vec<u8>>)
+                // so they are cheap to clone.
                 _ => Some(val.clone()),
             }
         } else {
