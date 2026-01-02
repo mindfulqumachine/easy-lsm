@@ -9,10 +9,42 @@ use std::{
 pub(crate) type KeyLenType = u16;
 pub(crate) type LsnType = u64;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 #[derive(Debug)]
 pub(crate) struct Key {
     pub lsn: AtomicU64,
     pub bytes: Arc<[u8]>,
+}
+
+impl Serialize for Key {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let lsn = self.lsn.load(AtomicOrdering::Relaxed);
+        (lsn, &self.bytes[..]).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Key {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let (lsn, bytes): (u64, Vec<u8>) = Deserialize::deserialize(deserializer)?;
+        Ok(Key {
+            lsn: AtomicU64::new(lsn),
+            bytes: Arc::from(bytes),
+        })
+    }
+}
+
+impl std::hash::Hash for Key {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.bytes.hash(state);
+        self.lsn.load(AtomicOrdering::Relaxed).hash(state);
+    }
 }
 
 impl Clone for Key {

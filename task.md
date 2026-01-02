@@ -11,7 +11,7 @@ Tasks:
     a. check if a memtable has reached the max size in write_req's write_states::LeaderWritingMemtable state.
     b. if so, freeze it and start a new memtable with the corresponding wal.
     c. update the manifest with the new items and persist to disk.
-[] 4. Implement the sstable logic
+[x] 4. Implement the sstable logic
     a. the structure on disk. Read the README.md for details.
     b. loading the sstable's index and bloom filter to disk only.
     c. efficient searching using the index and bloom filter.

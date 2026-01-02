@@ -1,4 +1,5 @@
 pub(crate) mod block;
+pub mod bloom_filter;
 pub(crate) mod manifest;
 pub(crate) mod memtable;
 pub(crate) mod sstable;

@@ -13,7 +13,7 @@ use crate::{
         key::{Key, LsnType},
         manifest::Manifest,
         memtable::{Memtable, state},
-        sstable::Sstable,
+        sstable::{SSTABLE_EXTENSION, Sstable},
         wal::{self, Wal, WalReceipt, wal_states},
     },
     write_req::{WriteRequest, write_states},
@@ -31,6 +31,7 @@ struct RecoveredState {
     mutable_memtable: Arc<Memtable<state::Mutable>>,
     mutable_wal: Wal<wal::Writable>,
     frozen_memtables: Vec<Arc<Memtable<state::Immutable>>>,
+    sstables: Vec<Vec<Arc<Sstable>>>,
     next_lsn: LsnType,
 }
 
@@ -134,7 +135,7 @@ impl<State> Db<State> {
             mutable_memtable: state.mutable_memtable,
             mutable_wal: state.mutable_wal,
             frozen_memtables: state.frozen_memtables,
-            sstables: Vec::new(),
+            sstables: state.sstables,
         };
 
         let write_sync = Arc::new(Mutex::new(WriteSyncs::new(state.next_lsn)));
@@ -167,7 +168,14 @@ impl<State> Db<State> {
             }
         }
 
-        // TODO: Check SSTables once implemented.
+        // Check SSTables
+        for level in &current_version.sstables {
+            for sstable in level {
+                if let Some(val) = sstable.search(key)? {
+                    return Ok(Some(val));
+                }
+            }
+        }
 
         Ok(None)
     }
@@ -175,6 +183,22 @@ impl<State> Db<State> {
     #[cfg(test)]
     pub(crate) fn new_test() -> Db<db_states::ReadWrite> {
         use crate::data_stores::{manifest::Manifest, memtable::Memtable, wal::wal_states};
+        use tempfile::tempdir;
+
+        // Leak the tempdir so it persists for the duration of the test.
+        // The OS will clean it up typically, or we should wrap Db in a helper that drops the dir.
+        // But for unit tests, leaking a few MBs of temp dirs is acceptable vs complexity.
+        // A better approach is `DbTestGuard` but changing return type affects all calls.
+        // We'll just leak the tempdir path string/creation but keep the integrity.
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        // Prevent deletion at end of scope by converting to "into_path" or similar?
+        // tempfile::TempDir deletes on drop.
+        // We need the directory to persist while Db is alive.
+        // Db owns `db_dir`.
+        // If we drop `dir` here, the directory is deleted.
+        // So we must persist `dir` somewhere or let it leak.
+        let path = dir.into_path(); // Consumes TempDir, persists path.
 
         let write_sync = Arc::new(Mutex::new(WriteSyncs {
             write_queue: VecDeque::new(),
@@ -187,11 +211,8 @@ impl<State> Db<State> {
         let version = DbVersion {
             next_lsn: 0,
             mutable_memtable: Arc::new(Memtable::new()),
-            mutable_wal: crate::data_stores::wal::Wal::<wal_states::Writable>::open(
-                std::path::Path::new("/tmp"),
-                0,
-            )
-            .unwrap(),
+            mutable_wal: crate::data_stores::wal::Wal::<wal_states::Writable>::open(&path, 0)
+                .unwrap(),
             frozen_memtables: Vec::new(),
             sstables: Vec::new(),
         };
@@ -202,7 +223,7 @@ impl<State> Db<State> {
             wal_cv: Condvar::new(),
             mem_cv: Condvar::new(),
             manifest_lock: Mutex::new(Manifest::new(0)),
-            db_dir: PathBuf::from("/tmp"),
+            db_dir: path,
             state: PhantomData,
         }
     }
@@ -402,10 +423,26 @@ fn recover_state(
     let (mutable_memtable, max_lsn) = mutable_res?;
 
     let mutable_wal = Wal::<wal_states::Writable>::open(db_dir, mutable_wal_id)?;
+
+    // Recover SSTables
+    // Iterate manifest levels and open sstables
+    let mut sstables = Vec::new();
+    for level in &manifest.levels {
+        let mut level_sstables = Vec::new();
+        for file_meta in &level.files {
+            let file_id = file_meta.file_id;
+            let path = db_dir.join(format!("{:05}.{}", file_id, SSTABLE_EXTENSION));
+            let sstable = Sstable::new(&path)?;
+            level_sstables.push(Arc::new(sstable));
+        }
+        sstables.push(level_sstables);
+    }
+
     Ok(RecoveredState {
         mutable_memtable: Arc::new(mutable_memtable),
         mutable_wal,
         frozen_memtables,
+        sstables,
         next_lsn: max_lsn + 1,
     })
 }
@@ -506,12 +543,6 @@ mod tests {
     fn test_get_from_frozen() {
         use std::sync::Arc;
 
-        let dir = std::env::temp_dir().join("test_get_from_frozen");
-        if dir.exists() {
-            fs::remove_dir_all(&dir).unwrap();
-        }
-        fs::create_dir(&dir).unwrap();
-
         let db = Db::<db_states::ReadWrite>::new_test();
 
         // 1. Create a memtable, put some data, and freeze it
@@ -525,8 +556,7 @@ mod tests {
             next_lsn: current_guard.next_lsn,
             mutable_memtable: current_guard.mutable_memtable.clone(),
             frozen_memtables: vec![frozen_mem],
-            mutable_wal: Wal::<wal_states::Writable>::open(std::path::Path::new("/tmp"), 999)
-                .unwrap(),
+            mutable_wal: Wal::<wal_states::Writable>::open(&db.db_dir, 999).unwrap(),
             sstables: Vec::new(),
         };
         db.current.store(Arc::new(new_version));
@@ -546,8 +576,6 @@ mod tests {
             Some(Value::Bytes(b)) => assert_eq!(&*b, b"val_active"),
             _ => panic!("Should get active value"),
         }
-
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
