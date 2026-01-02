@@ -3,7 +3,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use crate::{
     Db,
     data_stores::{key::Key, value::Value, wal::WalReceipt},
-    err,
+    err::{self, DbError},
 };
 
 pub(crate) mod write_states {
@@ -402,12 +402,13 @@ impl<R: Clone> Writer<write_states::LeaderWritingWal<R>> {
             req.key.update_lsn(lsn);
 
             // Serialize using strictly typed WAL encoder directly into the buffer
-            crate::data_stores::wal::Wal::encode_entry(
-                &req.key.bytes,
-                lsn,
-                &req.value,
+            // Wal<Writable> provides the static encode_entry method.
+            crate::data_stores::wal::Wal::<crate::data_stores::wal::wal_states::Writable>::encode_entry(
                 &mut wal_bytes,
-            );
+                &req.key,
+                &req.value,
+            )
+            .map_err(|e| DbError::Io(Arc::new(e)))?;
         }
 
         let receipt = db.write_wal(&wal_bytes)?;

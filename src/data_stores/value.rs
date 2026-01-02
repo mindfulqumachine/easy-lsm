@@ -21,6 +21,9 @@ impl Value {
     pub(crate) const WAL_TYPE_STR: u8 = 1 << 1;
     pub(crate) const WAL_TYPE_INT: u8 = 2 << 1;
 
+    // Header size: Type/Tag (1) + Len (4)
+    pub(crate) const SERIALIZED_HEADER_SIZE: usize = 5;
+
     pub(crate) fn new(bytes: &[u8]) -> Self {
         Value::Bytes(Arc::from(bytes))
     }

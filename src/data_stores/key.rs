@@ -55,6 +55,8 @@ impl Ord for Key {
 }
 
 impl Key {
+    pub(crate) const SERIALIZED_HEADER_SIZE: usize = 10; // LSN(8) + Len(2)
+
     pub(crate) fn new(bytes: &[u8], lsn: LsnType) -> Self {
         Self {
             lsn: AtomicU64::new(lsn),

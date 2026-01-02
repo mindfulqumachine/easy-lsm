@@ -47,24 +47,27 @@ impl Memtable<state::Mutable> {
     /// It calculates the total size delta and updates `size_bytes`.
     pub fn put_batch(&self, reqs: &[Arc<WriteRequest>]) {
         for req in reqs {
-            // Check if key exists to update size correctly
-            // Issue: `store.insert` will overwrite if `Key` matches.
-            // But `Key` includes `lsn`. So every write with new LSN is a NEW entry in the SkipMap.
-
-            let k_len = req.key.bytes.len();
-            let v_len = match &req.value {
-                Value::Bytes(b) => b.len(),
-                Value::Str(s) => s.len(),
-                Value::Int(_) => 8,
-                Value::Tombstone => 0,
-            };
-
-            // Overhead: Key(10), Value(6)
-            let entry_size = 10 + k_len + 6 + v_len;
-
-            self.size_bytes.fetch_add(entry_size, Ordering::Relaxed);
-            self.store.insert(req.key.clone(), req.value.clone());
+            self.recover(req.key.clone(), req.value.clone());
         }
+    }
+
+    /// Inserts a key-value pair directly into the memtable.
+    /// Used for recovery from WAL.
+    pub fn recover(&self, key: Key, value: Value) {
+        let k_len = key.bytes.len();
+        let v_len = match &value {
+            Value::Bytes(b) => b.len(),
+            Value::Str(s) => s.len(),
+            Value::Int(_) => 8,
+            Value::Tombstone => 0,
+        };
+
+        // Overhead: Key + Value headers
+        let entry_size =
+            Key::SERIALIZED_HEADER_SIZE + k_len + Value::SERIALIZED_HEADER_SIZE + v_len;
+
+        self.size_bytes.fetch_add(entry_size, Ordering::Relaxed);
+        self.store.insert(key, value);
     }
 
     /// Freezes the memtable, preventing further writes.

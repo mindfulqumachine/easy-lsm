@@ -3,7 +3,10 @@ Tasks:
 [x] 2. Implement the logic to read from the manifest at startup.
     a. Manifest in memory and on-disk structure.
     b. reading and writing to manifest.
-[] Incorporate manifest searching and reading as part of startup.
+[x] 6. Incorporate manifest searching and reading as part of startup.
+    a. [x] Refactor Manifest discovery logic (recover_or_init).
+    b. [x] Refactor Db::new to use unified recovery flow.
+    c. [x] Implement LSN consistency checks.
 [] 3. Memtable size check and freeze
     a. check if a memtable has reached the max size.
     b. if so, freeze it and start a new memtable.

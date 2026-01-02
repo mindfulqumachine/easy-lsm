@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -8,6 +8,10 @@ use crate::data_stores::key::Key;
 use crate::err::DbError;
 
 const MANIFEST_MAGIC: u32 = 0x4D534C45; // "ELSM" in little-endian (M, S, L, E) -> E, L, S, M
+
+// Update this version when you change the on-disk
+// format of manifest.
+const MANIFEST_FORMAT_VERSION: u32 = 0;
 
 #[derive(Debug, Clone)]
 pub(crate) struct FileMetadata {
@@ -60,18 +64,119 @@ impl Loggable for Level {
 /// The Manifest represents the snapshot of the database state.
 #[derive(Debug, Clone)]
 pub struct Manifest {
-    pub(crate) format_version: u32,
     pub(crate) wals: Vec<u32>,     // Active WAL IDs
     pub(crate) levels: Vec<Level>, // Levels of SSTables
+    next_file_id: u32,
 }
 
 impl Manifest {
-    pub(crate) fn new() -> Self {
+    pub(crate) const MANIFEST_EXTENSION: &str = ".mf";
+
+    /// Creates a new, empty manifest.
+    /// This is called during the pristine start of the database.
+    /// Most likely you are looking for the
+    /// try_open() function.
+    /// Creates a new manifest.
+    /// Requires the ID of the first WAL to ensure valid state.
+    pub(crate) fn new(initial_wal_id: u32) -> Self {
         Self {
-            format_version: 1,
-            wals: Vec::new(),
+            wals: vec![initial_wal_id],
             levels: Vec::new(),
+            next_file_id: initial_wal_id + 1,
         }
+    }
+
+    // Read the manifest file off the disk and initialize the manifest structure.
+    pub(crate) fn try_open(manifest_file_path: &Path) -> Result<Self, DbError> {
+        let file = File::open(manifest_file_path).map_err(|e| DbError::Io(Arc::new(e)))?;
+        let mut reader = BufReader::new(file);
+        let mut manifest = Self::decode(&mut reader)?;
+
+        let manifest_id = Path::new(manifest_file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<u32>().ok())
+            .ok_or(DbError::ManifestReadError(format!(
+                "Invalid manifest file name: {}",
+                manifest_file_path.display()
+            )))?;
+
+        manifest.next_file_id = manifest_id + 1;
+
+        Ok(manifest)
+    }
+
+    /// Attempts to load the latest valid manifest from `db_dir`.
+    ///
+    /// - **Scans** for `*.mf` files.
+    /// - **Validates**: If a corrupt/invalid manifest is found, returns `Err` asking user to delete it.
+    /// - **Pristine Case**: If no manifest exists, creates a new one, initializes `00000.wal`, persists both, and returns the new manifest.
+    /// - **Existing Case**: Returns the latest valid manifest.
+    pub(crate) fn recover_or_init(db_dir: &Path) -> Result<Self, DbError> {
+        std::fs::read_dir(db_dir)
+            .map_err(|e| DbError::Io(Arc::new(e)))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.path().extension().map_or(false, |ext| {
+                    ext == Manifest::MANIFEST_EXTENSION.trim_start_matches('.')
+                })
+            })
+            .filter_map(|entry| {
+                entry
+                    .path()
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(|stem| stem.parse::<u32>().ok())
+                    .map(|id| (id, entry.path()))
+            })
+            .max_by_key(|(id, _)| *id) // gives the manifest with the highest ID if exists.
+            .map(|(_id, path)| {
+                Manifest::try_open(&path).map_err(|e| {
+                    DbError::ManifestReadError(format!(
+                        "Failed to open manifest at {:?}: {}. Please delete this file and retry.",
+                        path, e
+                    ))
+                })
+            }) // If found, try to open it.
+            // If not found, create a new manifest and  return it.
+            .unwrap_or_else(|| Manifest::prepare_pristine_start(db_dir))
+    }
+
+    fn prepare_pristine_start(db_dir: &Path) -> Result<Manifest, DbError> {
+        let wal_id = 0;
+
+        // Create the first WAL on disk.
+        // We use Wal::create_at to ensure correct naming and initialization.
+        // We drop the resulting Wal object because Db::new will re-open it as part of startup.
+        use crate::data_stores::wal::Wal;
+        let wal = Wal::create_at(db_dir, wal_id)?;
+
+        // Create manifest with the ID of the WAL we just created.
+        let m = Manifest::new(wal.id);
+
+        // Persist the new manifest
+        m.write_to_disk(db_dir.to_str().ok_or(DbError::DirectoryNotFound(
+            "Invalid path encoding".to_string(),
+        ))?)?;
+
+        Ok(m)
+    }
+    // This writes the current manifest data to disk.
+    pub(crate) fn write_to_disk(&self, base_dir: &str) -> Result<(), DbError> {
+        let path = Path::new(base_dir).join(format!(
+            "{:05}{}",
+            self.next_file_id,
+            Self::MANIFEST_EXTENSION
+        ));
+        let file = File::create(&path).map_err(|e| DbError::Io(Arc::new(e)))?;
+        let mut writer = BufWriter::new(file);
+        self.encode(&mut writer)?;
+        writer.flush().map_err(|e| DbError::Io(Arc::new(e)))?;
+        writer
+            .get_mut()
+            .sync_all()
+            .map_err(|e| DbError::Io(Arc::new(e)))?;
+        Ok(())
     }
 }
 
@@ -98,7 +203,7 @@ impl Loggable for Manifest {
         // 3. Size
         size.encode(writer)?;
         // 4. Format Version
-        self.format_version.encode(writer)?;
+        MANIFEST_FORMAT_VERSION.encode(writer)?;
         // 5. Num Wals (redundant but in spec)
         (self.wals.len() as u32).encode(writer)?;
         // 6. Num Levels (redundant but in spec)
@@ -120,6 +225,9 @@ impl Loggable for Manifest {
         let checksum = u32::decode(reader)?;
         let size = u32::decode(reader)?;
         let format_version = u32::decode(reader)?;
+        if format_version != MANIFEST_FORMAT_VERSION {
+            return Err(DbError::ManifestCorrupted);
+        }
         let _num_wals = u32::decode(reader)?; // We trust the Vec's built-in length
         let _num_levels = u32::decode(reader)?;
 
@@ -141,68 +249,10 @@ impl Loggable for Manifest {
         let levels = Vec::<Level>::decode(&mut body_reader)?;
 
         Ok(Self {
-            format_version,
             wals,
             levels,
+            next_file_id: 0, // This is set by the caller. Only a placeholder for now.
         })
-    }
-}
-
-impl Manifest {
-    /// Writes the current manifest state to a new file in `base_dir`
-    /// Returns the new manifest version number.
-    pub(crate) fn write_to_disk(&self, base_dir: &str, next_version: u32) -> Result<(), DbError> {
-        let path = Path::new(base_dir).join(format!("{:05}.mf", next_version));
-        let file = File::create(&path).map_err(|e| DbError::Io(Arc::new(e)))?;
-        let mut writer = BufWriter::new(file);
-
-        self.encode(&mut writer)
-            .map_err(|e| DbError::Io(Arc::new(e)))?;
-
-        writer.flush().map_err(|e| DbError::Io(Arc::new(e)))?;
-        writer
-            .get_mut()
-            .sync_all()
-            .map_err(|e| DbError::Io(Arc::new(e)))?;
-
-        Ok(())
-    }
-
-    /// Opens the latest manifest from `base_dir`.
-    /// Returns (Manifest, current_version_number).
-    pub(crate) fn open(base_dir: &str) -> Result<(Self, u32), DbError> {
-        let dir = fs::read_dir(base_dir).map_err(|e| DbError::Io(Arc::new(e)))?;
-
-        let mut manifest_files = Vec::new();
-
-        for entry in dir {
-            let entry = entry.map_err(|e| DbError::Io(Arc::new(e)))?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("mf") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if let Ok(version) = stem.parse::<u32>() {
-                        manifest_files.push((version, path));
-                    }
-                }
-            }
-        }
-
-        // Sort by version descending
-        manifest_files.sort_by(|a, b| b.0.cmp(&a.0));
-
-        for (version, path) in manifest_files {
-            let file = File::open(&path).map_err(|e| DbError::Io(Arc::new(e)))?;
-            let mut reader = BufReader::new(file);
-
-            // Attempt decode
-            match Manifest::decode(&mut reader) {
-                Ok(m) => return Ok((m, version)),
-                Err(_) => continue, // Try older version if corrupt
-            }
-        }
-
-        // If no valid manifest found, return default (new db)
-        Ok((Manifest::new(), 0))
     }
 }
 
@@ -214,7 +264,7 @@ mod tests {
 
     #[test]
     fn test_manifest_serialization() {
-        let mut m = Manifest::new();
+        let mut m = Manifest::new(1);
         m.wals = vec![1, 2, 3];
 
         let k1 = Key::new(b"a", 100);
@@ -239,7 +289,6 @@ mod tests {
         assert_eq!(decoded.levels.len(), 1);
         assert_eq!(decoded.levels[0].files.len(), 1);
         assert_eq!(decoded.levels[0].files[0].file_id, 99);
-        assert_eq!(decoded.format_version, 1);
 
         // Verify Magic Number
         let magic_slice = &buf[0..4];
