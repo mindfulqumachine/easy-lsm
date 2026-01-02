@@ -25,12 +25,6 @@ pub(crate) mod write_states {
     #[derive(Clone)]
     pub(crate) struct SeekingMembership;
 
-    // Of all the requests seeking membership, the one at the front of the queue declares
-    // itself the leader. The leader then forms a write group with other
-    // requests that have been queued so far.
-    #[derive(Clone)]
-    pub(crate) struct DeclareLeader;
-
     // This state means the write group is decided. A writer can emerge out of the
     // last state as a leader or follower.
     // The leader will perform all the subsequent work for all members of the group.
@@ -51,7 +45,7 @@ pub(crate) mod write_states {
     // write to WAL. So, this state is a barrier to ensure the order.
     pub(crate) struct LeaderWaitingToWriteMemtable<'a, S, R>(
         pub(super) GroupGuard<R>,
-        pub(super) TicketGuard<'a, S, R>,
+        pub(super) TicketGuard<'a, S>,
         pub(super) WalReceipt,
     );
 
@@ -60,7 +54,8 @@ pub(crate) mod write_states {
     // writing to the memtable at the same time.
     pub(crate) struct LeaderWritingMemtable<'a, S, R>(
         pub(super) GroupGuard<R>,
-        pub(super) TicketGuard<'a, S, R>,
+        // we never read it. It is our drop guard.
+        #[allow(dead_code)] pub(super) TicketGuard<'a, S>,
         pub(super) WalReceipt,
     );
 
@@ -81,22 +76,22 @@ struct CompletionState {
 
 /// The passive data payload for a write request.
 pub(crate) struct WriteRequest {
-    key: Key,
-    value: Value,
+    pub(crate) key: Key,
+    pub(crate) value: Value,
     completion: Arc<CompletionState>,
 }
 
 /// The active actor driving the write request state machine.
 pub(crate) struct Writer<State> {
-    req: Arc<WriteRequest>,
+    pub(crate) req: Arc<WriteRequest>,
     state: State,
 }
 
 /// When this guard drops, the wal is free for the next write group.
-struct WalGuard<'a, S, R> {
-    db: &'a Db<S, R>,
+struct WalGuard<'a, S> {
+    db: &'a Db<S>,
 }
-impl<'a, S, R> Drop for WalGuard<'a, S, R> {
+impl<'a, S> Drop for WalGuard<'a, S> {
     fn drop(&mut self) {
         let mut g = self.db.write_sync.lock().unwrap();
         g.wal_busy = false;
@@ -106,11 +101,11 @@ impl<'a, S, R> Drop for WalGuard<'a, S, R> {
 
 /// When this guard drops, the next ticket holder
 /// will be set to write to memtable.
-struct TicketGuard<'a, S, R> {
-    db: &'a Db<S, R>,
+struct TicketGuard<'a, S> {
+    db: &'a Db<S>,
     ticket_num: usize,
 }
-impl<'a, S, R> Drop for TicketGuard<'a, S, R> {
+impl<'a, S> Drop for TicketGuard<'a, S> {
     fn drop(&mut self) {
         let mut g = self.db.write_sync.lock().unwrap();
 
@@ -193,7 +188,7 @@ impl Writer<write_states::WaitingToBeQueued> {
 impl Writer<write_states::WaitingToBeQueued> {
     pub(crate) fn step<S>(
         self,
-        db: &Db<S, write_states::WaitingToBeQueued>,
+        db: &Db<S>,
     ) -> Result<Writer<write_states::SeekingMembership>, err::DbError> {
         let mut g = db.write_sync.lock().unwrap();
         // The queue now stores the passive data request, not the actor.
@@ -215,9 +210,9 @@ impl Writer<write_states::SeekingMembership> {
     // if not, check if self is at the head of the queue.
     // if yes, become leader.
     // else, continue waiting.
-    pub(crate) fn step<S>(
+    pub(crate) fn step(
         self,
-        db: &Db<crate::db_states::ReadWrite, S>,
+        db: &Db<crate::db_states::ReadWrite>,
     ) -> Result<SeekingMembershipResult, err::DbError> {
         loop {
             // Check if I have a completion result.
@@ -329,9 +324,9 @@ impl Writer<write_states::FollowerWaitingCompletion> {
 ///     if so, go back to sleeping on the wal_cv.
 /// 2. If it is free, then proceed to the next step.
 impl<R> Writer<write_states::LeaderWaitingToWriteWal<R>> {
-    pub(crate) fn step<S>(
+    pub(crate) fn step(
         self,
-        db: &Db<crate::db_states::ReadWrite, S>,
+        db: &Db<crate::db_states::ReadWrite>,
     ) -> Result<Writer<write_states::LeaderWritingWal<R>>, err::DbError> {
         let mut g = db.write_sync.lock().unwrap();
         loop {
@@ -368,7 +363,7 @@ impl<R> Writer<write_states::LeaderWaitingToWriteWal<R>> {
 impl<R: Clone> Writer<write_states::LeaderWritingWal<R>> {
     pub(crate) fn step<'a>(
         mut self,
-        db: &'a Db<crate::db_states::ReadWrite, R>,
+        db: &'a Db<crate::db_states::ReadWrite>,
     ) -> Result<
         Writer<write_states::LeaderWaitingToWriteMemtable<'a, crate::db_states::ReadWrite, R>>,
         err::DbError,
@@ -402,6 +397,9 @@ impl<R: Clone> Writer<write_states::LeaderWritingWal<R>> {
             // We construct a temporary Key with the assigned LSN just for serialization.
             // This avoids mutating the shared WriteRequest.
             let lsn = batch_start_lsn + i as u64;
+
+            // Update the key's LSN in-place so it carries the correct version for Memtable.
+            req.key.update_lsn(lsn);
 
             // Serialize using strictly typed WAL encoder directly into the buffer
             crate::data_stores::wal::Wal::encode_entry(
@@ -438,9 +436,9 @@ impl<R: Clone> Writer<write_states::LeaderWritingWal<R>> {
 // All other leaders without a matching
 // ticket number go back to sleep on the mem_cv.
 impl<'a, R> Writer<write_states::LeaderWaitingToWriteMemtable<'a, crate::db_states::ReadWrite, R>> {
-    pub(crate) fn step<S>(
+    pub(crate) fn step(
         self,
-        db: &Db<crate::db_states::ReadWrite, S>,
+        db: &Db<crate::db_states::ReadWrite>,
     ) -> Result<
         Writer<write_states::LeaderWritingMemtable<'a, crate::db_states::ReadWrite, R>>,
         err::DbError,
@@ -484,9 +482,9 @@ impl<'a>
         >,
     >
 {
-    pub(crate) fn step<S>(
+    pub(crate) fn step(
         self,
-        db: &Db<crate::db_states::ReadWrite, S>,
+        db: &Db<crate::db_states::ReadWrite>,
     ) -> Result<
         Writer<write_states::LeaderFinishingWrite<write_states::WaitingToBeQueued>>,
         err::DbError,
@@ -532,8 +530,8 @@ mod tests {
     use std::thread;
 
     // Helper to create a test Db instance
-    fn create_test_db() -> Arc<Db<db_states::ReadWrite, write_states::WaitingToBeQueued>> {
-        Arc::new(Db::<db_states::ReadWrite, write_states::WaitingToBeQueued>::new_test())
+    fn create_test_db() -> Arc<Db<db_states::ReadWrite>> {
+        Arc::new(Db::<db_states::ReadWrite>::new_test())
     }
 
     /// Verifies the full state transition flow of a Writer.

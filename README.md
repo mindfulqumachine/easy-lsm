@@ -173,10 +173,13 @@ For some reason if the compaction failed and could not delete the oldest manifes
 |magic_bytes|4 bytes| [u8; 4]|The text "ELSM"|
 |checksum|4 bytes|u32|file integrity|
 |file-size|4 bytes|u32|How many more bytes to read and checksum before moving forward|
-|format-version|4 bytes| u32||
+|format-version|4 bytes| u32|If the format of the manifest changes we increment this. This change will cause the database to reject the old manifest file.|
 |num_wals|4 bytes|u32|How many wal entries; how many memtables to generate|
 |num levels|4 bytes|u32|How many levels of sstables we have currently|
 |levels|variable|-|The payload: A sequence of num_levels `Level structures`|
+
+The in-memory version of the manifest will contain the next-manifest-number. The
+next manifest file will be named `next-manifest-number.mf`.
 
 ##### Level Structure
 |Field|Size|Type|Description|
@@ -272,21 +275,25 @@ updates of an existing key with the tombstone set.
 
 In the rest of the section, we will go over how to represent this.
 
-A WAL has one-to-one correspondence with the memtable. So, there is a WAL file created for each
-memtable.
+### Write-Ahead Log (WAL)
 
-The structure of a WAL entry:
-- CRC: 4 bytes (Checksum of the entry)
-- lsn: 8 bytes
-- tombstone: 1 byte
-- key-len: 2 bytes (limits key size to 65535 bytes or 65 KB).
-- value-len: 4 bytes (limits value size to 4GB).
-- value-type: 1 byte
-- key: `key-len` bytes
-- value: `value-len` bytes
+The WAL is an append-only file that stores every write operation.
 
-The fixed length fields are organized as a header, followed by the variable length key and value.
-This makes parsing easier.
+**Format**:
+Each entry consists of:
+1.  **CRC** (4 bytes): CRC32 checksum of the rest of the entry.
+2.  **Key** (Variable): The serialized key.
+    -   **LSN** (8 bytes)
+    -   **Length** (2 bytes)
+    -   **Bytes** (Variable)
+3.  **Value** (Variable): The serialized value.
+    -   **Metadata** (1 byte):
+        -   Bit 0: Tombstone (1=True, 0=False).
+        -   Bits 1..7: Type (0=Bytes, 1=String, 2=Int).
+    -   **Length** (4 bytes)
+    -   **Bytes** (Variable)
+
+This format ensures that even partial writes can be detected (via CRC or truncated read) and ignored during recovery.
 
 A WAL is written and read from start to finish. Therefore, we
 do not need clever mechanisms like in sstable to compare and skip

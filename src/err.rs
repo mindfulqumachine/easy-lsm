@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone)]
@@ -15,7 +15,10 @@ pub enum DbError {
     #[error("Manifest not found")]
     ManifestNotFound,
 
-    #[error("Manifest is corrupted")]
+    #[error("Manifest read error: {0}")]
+    ManifestReadError(String),
+
+    #[error("Manifest corrupted")]
     ManifestCorrupted,
 
     #[error("Writer panic. Operation aborted.")]

@@ -1,27 +1,21 @@
-Goal: To implement the WAL writes to disk.
-
-Context:
-1. README.md: For overall project description.
-2. wal.rs
-3. key.rs
-4. value.rs
-
-Task details:
-1. I want to @wal.rs#L14 fn write().
-    When complete it should write the bytes to the WAL file.
-Verification:
-    - A test that writes multiple key / values pairs to the WAL file. Then closes and reopens the WAL and reads it. The key value / pairs should be the same as written.
-
-2. From the test description, it is clear we also need to implement the WAL read.
-
-3. Key implementation, both the memory and the on-disk representation has to be implemented.
-    look at the README's internal key-format and internal-value-format sections for more details.
-    Also look at the structures on disk section's WAL sub-section for more details.
-
-## General instructions.
-1. Please discuss your thoughs before starting to implement.
-2. The implementation should be safe by construction. reference write_req.rs for an example of correct by construction implementation. Your implementation has to be better than that in 
-terms of correctness and clarity of implementation.
-3. Please document the code and tests well.
-
-    
+Tasks:
+[x] 1. Implement the data serialization/deserialization organization into key.rs and value.rs.
+[x] 2. Implement the logic to read from the manifest at startup.
+    a. Manifest in memory and on-disk structure.
+    b. reading and writing to manifest.
+[] Incorporate manifest searching and reading as part of startup.
+[] 3. Memtable size check and freeze
+    a. check if a memtable has reached the max size.
+    b. if so, freeze it and start a new memtable.
+    c. update the manifest.
+[] 4. Implement the sstable logic
+    a. the structure on disk.
+    b. loading the sstable's index and bloom filter to disk only.
+    c. efficient searching using the index and bloom filter.
+[] 5. Compaction logic.
+    a. start  in a thread with the database.
+    b. handle thread crashes.
+    c. Flush memtable to disk.
+    d. updating manifest.
+    e. merge for L0 sstables to L1.
+    f. comapct L_N sstables to L_(N+1) (where N >= 1).
