@@ -246,6 +246,7 @@ The 4KB block size is a "soft limit" or target size.
    - The next key-value pair starts a new block.
 
 #### Index Block Format
+The Index Block follows the same structure as the Data Block (block-len, checksum, entries).
 The entries of the index block store a list of keys in `Internal Key` format.
 
 1. min-key for sstable in `InternalKey` format.
@@ -631,7 +632,7 @@ one of the sstables.
     a. If the bloom filter says it is present, then we have to look. So, we binary search through
          index blocks to find a data-block where the key could be present. (The search key is greater
         than or equal to the block key but less than the next block key).
-    a. Now that we landed on a data block, we page in the full 4KB data block and binary search
+    a. Now that we landed on a data block, we page in the full 4KB data block and linear scan
         through it until we find the key within the read-version constraint. If not, we need to go
         on to the next level and repeat the same steps. Know that bloom filter is definitive answer
         when it comments about the key not present. It is not 100% sure when it says the key is

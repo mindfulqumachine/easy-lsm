@@ -35,7 +35,8 @@ You are an expert Rust systems engineer working on `easy-lsm`, a high-performanc
 *   **Error Handling**: Use `crate::err::DbError` exclusively. No generic `anyhow`.
 
 ## 4. Workflow
-1.  **Plan**: Outline changes in `task.md` or scratchpad.
+1.  **Plan**: Outline changes in `task.md` or scratchpad. Ensure the plan 
+    contains code snippets and comments to explain the logic.
 2.  **Discuss**: detailed proposals for non-trivial changes.
 3.  **Review**: Self-critique code against "Correctness by Construction" rules.
 4. **Implement**: Implement after the user gives the green light.
