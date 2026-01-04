@@ -12,7 +12,7 @@ use std::{
 pub(crate) const WAL_EXTENSION: &str = ".wal";
 pub(crate) const WAL_MAGIC: u32 = 0xCAFE_BABE;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Wal<S = Writable> {
     state: S,
     pub(crate) id: u32,
@@ -28,13 +28,13 @@ pub mod wal_states {
     use std::sync::{Arc, Mutex};
 
     /// State for a WAL that is active and being written to.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct Writable {
         pub(crate) file: Arc<Mutex<BufWriter<File>>>,
     }
 
     /// State for a WAL that is old, immutable, and only used for recovery.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct ReadOnly {
         pub(crate) file: Arc<File>,
     }

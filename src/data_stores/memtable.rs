@@ -104,13 +104,20 @@ impl Memtable<state::Mutable> {
     }
 }
 
+// ... existing code ...
 impl Memtable<state::Immutable> {
     /// Retrieves a value by key from the memtable.
     #[allow(dead_code)]
     pub fn flush(&self) -> Result<(), DbError> {
         unimplemented!()
     }
+
+    /// Iterator over the memtable entries.
+    pub fn iter(&self) -> impl Iterator<Item = crossbeam_skiplist::map::Entry<Key, Value>> {
+        self.store.iter()
+    }
 }
+// ... existing code ...
 
 impl<State> Memtable<State> {
     pub fn get(&self, key_bytes: &[u8]) -> Option<Value> {

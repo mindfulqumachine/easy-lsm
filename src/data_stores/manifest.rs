@@ -66,7 +66,11 @@ impl Loggable for Level {
 pub struct Manifest {
     pub(crate) wals: Vec<u32>,     // Active WAL IDs
     pub(crate) levels: Vec<Level>, // Levels of SSTables
-    next_file_id: u32,
+
+    // Transient IDs (recovered at startup)
+    pub(crate) next_wal_id: u32,
+    pub(crate) next_sstable_id: u32,
+    pub(crate) version: u32,
 }
 
 impl Manifest {
@@ -82,7 +86,9 @@ impl Manifest {
         Self {
             wals: vec![initial_wal_id],
             levels: Vec::new(),
-            next_file_id: initial_wal_id + 1,
+            next_wal_id: initial_wal_id + 1,
+            next_sstable_id: 0,
+            version: 0,
         }
     }
 
@@ -92,7 +98,7 @@ impl Manifest {
         let mut reader = BufReader::new(file);
         let mut manifest = Self::decode(&mut reader)?;
 
-        let manifest_id = Path::new(manifest_file_path)
+        let manifest_version = Path::new(manifest_file_path)
             .file_stem()
             .and_then(|s| s.to_str())
             .and_then(|s| s.parse::<u32>().ok())
@@ -101,7 +107,20 @@ impl Manifest {
                 manifest_file_path.display()
             )))?;
 
-        manifest.next_file_id = manifest_id + 1;
+        manifest.version = manifest_version;
+
+        // Initialize transient counters based on loaded data
+        let max_wal_id = manifest.wals.iter().max().copied().unwrap_or(0);
+        manifest.next_wal_id = max_wal_id + 1;
+
+        let max_sst_id = manifest
+            .levels
+            .iter()
+            .flat_map(|l| &l.files)
+            .map(|f| f.file_id)
+            .max()
+            .unwrap_or(0);
+        manifest.next_sstable_id = max_sst_id + 1;
 
         Ok(manifest)
     }
@@ -129,7 +148,7 @@ impl Manifest {
                     .and_then(|stem| stem.parse::<u32>().ok())
                     .map(|id| (id, entry.path()))
             })
-            .max_by_key(|(id, _)| *id) // gives the manifest with the highest ID if exists.
+            .max_by_key(|(id, _)| *id) // gives the manifest with the highest ID (version) if exists.
             .map(|(_id, path)| {
                 Manifest::try_open(&path).map_err(|e| {
                     DbError::ManifestReadError(format!(
@@ -155,50 +174,110 @@ impl Manifest {
         let m = Manifest::new(wal.id);
 
         // Persist the new manifest
-        m.write_to_disk(db_dir.to_str().ok_or(DbError::DirectoryNotFound(
-            "Invalid path encoding".to_string(),
-        ))?)?;
+        m.write_to_disk(
+            db_dir.to_str().ok_or(DbError::DirectoryNotFound(
+                "Invalid path encoding".to_string(),
+            ))?,
+            0,
+        )?;
 
         Ok(m)
     }
     // This writes the current manifest data to disk.
-    pub(crate) fn write_to_disk(&self, base_dir: &str) -> Result<(), DbError> {
-        let path = Path::new(base_dir).join(format!(
-            "{:05}{}",
-            self.next_file_id,
-            Self::MANIFEST_EXTENSION
-        ));
-        let file = File::create(&path).map_err(|e| DbError::Io(Arc::new(e)))?;
+    pub(crate) fn write_to_disk(&self, base_dir: &str, new_version: u32) -> Result<(), DbError> {
+        let filename = format!("{:05}{}", new_version, Self::MANIFEST_EXTENSION);
+        let path = Path::new(base_dir).join(filename);
+        self.write_to_path(&path)
+    }
+
+    pub(crate) fn write_to_path(&self, path: &Path) -> Result<(), DbError> {
+        let file = File::create(path).map_err(DbError::from)?;
         let mut writer = BufWriter::new(file);
-        self.encode(&mut writer)?;
-        writer.flush().map_err(|e| DbError::Io(Arc::new(e)))?;
-        writer
-            .get_mut()
-            .sync_all()
-            .map_err(|e| DbError::Io(Arc::new(e)))?;
+        self.encode(&mut writer).map_err(DbError::from)?;
+        writer.flush().map_err(DbError::from)?;
+        writer.get_ref().sync_all().map_err(DbError::from)?;
         Ok(())
     }
 
     /// Returns the next available WAL ID.
     pub(crate) fn next_wal_id(&self) -> u32 {
-        self.next_file_id
+        self.next_wal_id
     }
 
-    /// Commits the new WAL ID to the manifest and persists.
-    /// This should be called AFTER the WAL file is successfully created on disk.
-    /// We require the `Wal` reference as proof that it has been created.
-    pub(crate) fn commit_new_wal(
+    // / Commits the new WAL ID to the manifest and persists.
+    // / This should be called AFTER the WAL file is successfully created on disk.
+    // / We require the `Wal` reference as proof that it has been created.
+    pub fn commit_new_wal(
         &mut self,
         wal: &crate::data_stores::wal::Wal<crate::data_stores::wal::wal_states::Writable>,
         base_dir: &str,
     ) -> Result<(), DbError> {
-        if wal.id != self.next_file_id {
-            return Err(DbError::DataCorrupted("WAL ID mismatch".to_string()));
-        }
-        self.next_file_id += 1;
         self.wals.push(wal.id);
-        self.write_to_disk(base_dir)?;
+        self.write_to_disk(base_dir, self.version + 1)?;
+        self.version += 1;
         Ok(())
+    }
+}
+
+pub fn apply_atomic_update<F>(
+    manifest_lock: &std::sync::Arc<std::sync::Mutex<Manifest>>,
+    db_dir: &Path,
+    mutator: F,
+) -> Result<Manifest, DbError>
+where
+    F: Fn(&mut Manifest) -> Result<(), DbError>,
+{
+    let mut loop_count = 0;
+    loop {
+        loop_count += 1;
+        if loop_count > 3 {
+            return Err(DbError::Io(Arc::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Manifest commit loop exceeded retry limit",
+            ))));
+        }
+
+        // 1. Snapshot
+        let (current_version, mut candidate) = {
+            let guard = manifest_lock.lock().map_err(|_| DbError::WriterPanic)?;
+            (guard.version, guard.clone())
+        };
+
+        // 2. Mutate
+        mutator(&mut candidate)?;
+
+        // Ensure version increments
+        candidate.version += 1;
+
+        // 3. Serialize to TMP
+        let new_version_num = candidate.version;
+        let tmp_filename = format!("{:05}.mf.tmp", new_version_num);
+        let tmp_path = db_dir.join(&tmp_filename);
+        let final_filename = format!("{:05}.mf", new_version_num);
+        let final_path = db_dir.join(&final_filename);
+
+        candidate.write_to_path(&tmp_path)?;
+
+        // 4. Commit (Compare & Swap)
+        let mut guard = manifest_lock.lock().map_err(|_| DbError::WriterPanic)?;
+        if guard.version != current_version {
+            // Conflict: Version changed.
+            // Cleanup temp file and retry.
+            let _ = std::fs::remove_file(&tmp_path);
+            continue;
+        }
+
+        // Atomic Rename
+        if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(DbError::from(e));
+        }
+
+        // Update Memory
+        *guard = candidate.clone();
+
+        // Return the new manifest state
+        return Ok(candidate);
     }
 }
 
@@ -273,7 +352,10 @@ impl Loggable for Manifest {
         Ok(Self {
             wals,
             levels,
-            next_file_id: 0, // This is set by the caller. Only a placeholder for now.
+            // Transient fields are initialized by try_open / recover_or_init
+            next_wal_id: 0,
+            next_sstable_id: 0,
+            version: 0,
         })
     }
 }

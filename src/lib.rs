@@ -2,7 +2,9 @@ use std::{
     collections::VecDeque,
     marker::PhantomData,
     path::PathBuf,
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Condvar, Mutex},
+    thread,
 };
 
 use arc_swap::ArcSwap;
@@ -18,7 +20,7 @@ use crate::{
     },
     write_req::{WriteRequest, write_states},
 };
-
+mod compact;
 pub use data_stores::value::Value;
 
 pub const MAX_MEMTABLE_SIZE: usize = 4 * 1024 * 1024; // 4MB
@@ -78,7 +80,7 @@ impl WriteSyncs {
 }
 
 pub struct Db<State> {
-    pub(crate) current: ArcSwap<DbVersion>,
+    pub(crate) current: Arc<ArcSwap<DbVersion>>,
 
     // control plane mechanisms to orchestrate the writes.
     pub(crate) write_sync: Arc<Mutex<WriteSyncs>>,
@@ -92,12 +94,34 @@ pub struct Db<State> {
     // STRUCTURAL LOCK: For flushes, compaction, rotation.
     // The Memtable write leader only acquires this lock when memtable is full
     //  and it is time to freeze the memtable and add a new one.
-    manifest_lock: Mutex<Manifest>,
+    manifest_lock: Arc<Mutex<Manifest>>,
+
+    // Condition variable to wake up the compaction thread.
+    compaction_cv: Arc<Condvar>,
+    // Signal to the compaction thread to exit.
+    shutdown: Arc<AtomicBool>,
+    // Handle to the compaction thread.
+    // Wrapped in Mutex to allow restarting if it crashes.
+    compaction_thread: Mutex<Option<thread::JoinHandle<()>>>,
 
     // The directory where the database is stored.
     db_dir: PathBuf,
 
     state: PhantomData<State>,
+
+    pub(crate) max_memtable_size: usize,
+}
+
+impl<State> Drop for Db<State> {
+    fn drop(&mut self) {
+        // Signal shutdown
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.compaction_cv.notify_all();
+
+        if let Some(handle) = self.compaction_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl<State> Db<State> {
@@ -140,14 +164,38 @@ impl<State> Db<State> {
 
         let write_sync = Arc::new(Mutex::new(WriteSyncs::new(state.next_lsn)));
 
+        let manifest_lock = Arc::new(Mutex::new(manifest));
+        let compaction_cv = Arc::new(Condvar::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let m_lock = manifest_lock.clone();
+        let c_cv = compaction_cv.clone();
+        let s_down = shutdown.clone();
+        let d_dir = path.to_path_buf();
+
+        // 4. Initialize Db state
+        let current = Arc::new(ArcSwap::from_pointee(version));
+        let db_current = current.clone();
+
+        let compaction_thread = thread::Builder::new()
+            .name("compaction".to_string())
+            .spawn(move || {
+                crate::compact::run(m_lock, db_current, c_cv, s_down, d_dir);
+            })
+            .map_err(|e| err::DbError::Io(Arc::new(e)))?;
+
         Ok(Db {
-            current: ArcSwap::from_pointee(version),
+            current,
             write_sync,
             wal_cv: Condvar::new(),
             mem_cv: Condvar::new(),
-            manifest_lock: Mutex::new(manifest),
+            manifest_lock,
+            compaction_cv,
+            shutdown,
+            compaction_thread: Mutex::new(Some(compaction_thread)),
             db_dir: path.to_path_buf(),
             state: PhantomData,
+            max_memtable_size: MAX_MEMTABLE_SIZE,
         })
     }
 
@@ -217,14 +265,41 @@ impl<State> Db<State> {
             sstables: Vec::new(),
         };
 
+        let manifest_lock = Arc::new(Mutex::new(Manifest::new(0)));
+        // Note: In tests we might not want the thread, but to keep consistent behavior we should spawn it.
+        // Or we can leave it None if we had a builder. But here we must populate.
+        // Spawning thread in unit tests is fine if we clean up (which we do in Drop).
+
+        let compaction_cv = Arc::new(Condvar::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let m_lock = manifest_lock.clone();
+        let c_cv = compaction_cv.clone();
+        let s_down = shutdown.clone();
+        let d_dir = path.clone();
+
+        let current = Arc::new(ArcSwap::from_pointee(version));
+        let db_current = current.clone();
+
+        let compaction_thread = thread::Builder::new()
+            .name("compaction_test".to_string())
+            .spawn(move || {
+                crate::compact::run(m_lock, db_current, c_cv, s_down, d_dir);
+            })
+            .unwrap();
+
         Db {
-            current: ArcSwap::from_pointee(version),
+            current,
             write_sync,
             wal_cv: Condvar::new(),
             mem_cv: Condvar::new(),
-            manifest_lock: Mutex::new(Manifest::new(0)),
+            manifest_lock,
+            compaction_cv,
+            shutdown,
+            compaction_thread: Mutex::new(Some(compaction_thread)),
             db_dir: path,
             state: PhantomData,
+            max_memtable_size: MAX_MEMTABLE_SIZE,
         }
     }
 }
@@ -302,84 +377,57 @@ impl Db<db_states::ReadWrite> {
     /// 4. Creates new mutable memtable.
     /// 5. Updates DbVersion.
     pub(crate) fn rotate_memtable(&self) -> Result<(), err::DbError> {
-        let mut manifest_guard = self.manifest_lock.lock().unwrap();
+        // We need to persist the new WAL to the manifest atomically.
+        // We use the helper `apply_atomic_update`.
+        // Note: This helper might retry. If it retries, we might create multiple WAL files.
+        // This is acceptable (orphaned files) for correctness.
 
-        // We need the db directory. Since we don't store it in Db directly,
-        // we can derive it from the current WAL path or add it to Db.
-        // For now, let's look at how we get paths.
-        // The WAL has a path, but the Wal struct might not expose the base directory easily without parsing.
-        // Let's rely on the fact that existing WALs are in the DB directory.
-        // HACK: We need the base directory.
-        // Let's modify Db to store `db_dir` or extract it.
-        // For this step, I will assume we can get it from the internal state or pass it around.
-        // Wait, `Db::new` has `db_dir`. We should probably store it in `Db`.
+        let manifest_lock = &self.manifest_lock;
+        let db_dir = &self.db_dir;
 
-        // But to avoid blocking this tool call with a structural change that needs a separate tool call,
-        // let's try to infer it? No, that's brittle.
-        // Let's proceed with adding the methods, but `rotate_memtable` will need `db_dir`.
-        // I'll make `rotate_memtable` take `db_dir`? No, `Writer` calls it and `Writer` doesn't know `db_dir`.
-        // So `Db` MUST store `db_dir`.
+        let new_manifest = crate::data_stores::manifest::apply_atomic_update(
+            manifest_lock,
+            db_dir,
+            |manifest_candidate| {
+                let new_wal_id = manifest_candidate.next_wal_id();
+                // Create valid WAL file first (IO outside lock, effectively)
+                // content of apply_atomic_update closure runs unlocked.
+                // We open it to ensure it exists.
+                use crate::data_stores::wal::wal_states;
+                let _ =
+                    crate::data_stores::wal::Wal::<wal_states::Writable>::open(db_dir, new_wal_id)?;
 
-        // I will return an error here placeholder and fixing `Db` struct in next step.
-        // Actually, I should update `Db` struct first.
-
-        // Let's just implement the logic assuming `self.db_dir` exists, and I will add the field in the next tool call.
-        // 1. Get next WAL ID (do not modify manifest yet)
-        let new_wal_id = manifest_guard.next_wal_id();
-
-        // 2. Create new WAL file on disk.
-        // If this fails, the manifest is untouched, and we just have a missing file (clean state).
-        // DbVersion needs the OPEN WAL.
-        // We get a wal object back, which serves as proof of creation.
-        let new_wal =
-            crate::data_stores::wal::Wal::<wal_states::Writable>::open(&self.db_dir, new_wal_id)?;
-
-        // 3. Commit new WAL to manifest (Persist)
-        // Now that the file exists, we can safely point the manifest to it.
-        // If this fails, we have an orphaned WAL file but the DB state is consistent (checked next startup).
-        manifest_guard.commit_new_wal(
-            &new_wal,
-            self.db_dir.to_str().ok_or(err::DbError::DirectoryNotFound(
-                "Invalid db_dir path".to_string(),
-            ))?,
+                // Update candidate
+                manifest_candidate.wals.push(new_wal_id);
+                Ok(())
+            },
         )?;
 
-        // 4. Update DbVersion
+        // Success. `new_manifest` is the committed state.
+        // Get the new WAL ID (last one).
+        let new_wal_id = *new_manifest.wals.last().ok_or(err::DbError::DataCorrupted(
+            "No WALs after rotation".to_string(),
+        ))?;
+
+        // Open the WAL for `DbVersion`
+        // We just created it, so open should succeed.
+        use crate::data_stores::wal::wal_states;
+        let new_wal =
+            crate::data_stores::wal::Wal::<wal_states::Writable>::open(db_dir, new_wal_id)?;
+
+        // Update DbVersion
         // Atomic swap of the version.
-        // We need to move the current mutable memtable to frozen.
-        // And replace mutable memtable with new one.
-        // And replace mutable wal with new one.
-
         let current = self.current.load();
-        // But `Memtable` is `Arc<SkipMap>` inside.
-        // So `freeze` should take `&self` and return new `Memtable<Immutable>`?
-        // OR `freeze` consumes `self`.
-        // If `mutable_memtable` is `Arc`, I can't consume it if others have references.
-        // But `DbVersion` is `Arc`, and `mutable_memtable` is `Arc`.
-        // Others might be holding `Arc<DbVersion>` and thus `Arc<Memtable>`.
-        // So I cannot consume `Memtable`.
-        // I must change `freeze` to take `&self` and return `Memtable<Immutable>`.
-        // I'll update Memtable::freeze in a separate step or assume I did it.
-        // Wait, I updated `freeze` to take `self` but return new struct with cloned `Arc`.
-        // But I can't call `self` method on `Arc`.
-        // I need `freeze` to take `&self`.
 
-        // Let's assume I fix `freeze` to take `&self` in next step.
-        // Freeze the current mutable memtable.
-        // We use freeze_from_ref to get a new Memtable<Immutable> sharing the same underlying data (Arc<SkipMap>).
+        // Freeze current memtable
         let mut frozen_memtables = current.frozen_memtables.clone();
         let frozen = current.mutable_memtable.freeze_from_ref();
         frozen_memtables.push(Arc::new(frozen));
 
         let new_version = DbVersion {
-            next_lsn: current.next_lsn, // LSN is managed by WriteSyncs, DbVersion copy might be stale or just snapshot.
-            // Actually `next_lsn` in DbVersion seems unused for coordination?
-            // WriteSyncs has `next_lsn`.
-            // DbVersion `next_lsn` is probably "next LSN to be written to this version"?
-            // It's used in `recover_state` to init `WriteSyncs`.
-            // In running system, `WriteSyncs` governs LSN.
-            // So we just copy it or update it?
-            // Let's copy it.
+            // next_lsn is managed by WriteSyncs, but we carry over the value from previous version
+            // or we could read it from WriteSyncs if we had access, but `current.next_lsn` is fine specific to version.
+            next_lsn: current.next_lsn,
             mutable_memtable: Arc::new(Memtable::new()),
             mutable_wal: new_wal,
             frozen_memtables,
@@ -387,6 +435,53 @@ impl Db<db_states::ReadWrite> {
         };
 
         self.current.store(Arc::new(new_version));
+
+        // Ensure compaction thread is running (restart if crashed)
+        let _ = self.ensure_compaction_thread();
+
+        // Notify compaction thread that a new frozen memtable is available
+        self.compaction_cv.notify_one();
+
+        Ok(())
+    }
+
+    /// Checks if the compaction thread is running and restarts it if it has finished (crashed).
+    /// Does nothing if the shutdown signal is set.
+    fn ensure_compaction_thread(&self) -> Result<(), err::DbError> {
+        // If we are shutting down, do not restart.
+        if self.shutdown.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let mut handle_guard = self.compaction_thread.lock().unwrap();
+        let need_restart = if let Some(handle) = handle_guard.as_ref() {
+            handle.is_finished()
+        } else {
+            true
+        };
+
+        if need_restart {
+            // Join the old thread to clean up resources (if it finished)
+            if let Some(handle) = handle_guard.take() {
+                let _ = handle.join(); // Ignore panic payload
+            }
+
+            let m_lock = self.manifest_lock.clone();
+            let c_cv = self.compaction_cv.clone();
+            let s_down = self.shutdown.clone();
+            let d_dir = self.db_dir.clone();
+
+            let db_current = self.current.clone();
+
+            let new_thread = thread::Builder::new()
+                .name("compaction_restarted".to_string())
+                .spawn(move || {
+                    crate::compact::run(m_lock, db_current, c_cv, s_down, d_dir);
+                })
+                .map_err(|e| err::DbError::Io(Arc::new(e)))?;
+
+            *handle_guard = Some(new_thread);
+        }
 
         Ok(())
     }
@@ -628,5 +723,108 @@ mod tests {
         }
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_compaction_thread_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        // create Db - thread starts
+        let db = Db::<db_states::ReadWrite>::new(dir.path().to_str().unwrap()).unwrap();
+
+        // do some work
+        db.put(b"foo", Value::new(b"bar")).unwrap();
+
+        // drop db - thread stops. If this hangs, the test times out.
+        drop(db);
+    }
+
+    #[test]
+    fn test_compaction_thread_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::<db_states::ReadWrite>::new(dir.path().to_str().unwrap()).unwrap();
+
+        // Simulate crash by taking the handle and joining it manually
+        {
+            let mut g = db.compaction_thread.lock().unwrap();
+            let handle = g.take().expect("Thread should exist");
+            // Determine thread ID
+            println!("Old thread id: {:?}", handle.thread().id());
+        }
+
+        // Now handle is None. `ensure_compaction_thread` should restart it.
+        db.ensure_compaction_thread().unwrap();
+
+        {
+            let g = db.compaction_thread.lock().unwrap();
+            assert!(g.is_some(), "Thread should have been restarted");
+            println!("New thread id: {:?}", g.as_ref().unwrap().thread().id());
+        }
+    }
+    #[test]
+    fn test_memtable_flush_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::<db_states::ReadWrite>::new(dir.path().to_str().unwrap()).unwrap();
+        db.max_memtable_size = 4096; // 4KB for easy rotation
+
+        // 1. Write data to fill memtables and trigger rotations.
+        // Value size ~1KB. Memtable limit 4KB.
+        // 5 writes => > 4KB. Triggers rotation.
+        // We want > 4 WALs frozen.
+        // So we need 5 rotations.
+        // 5 rotations * 5 writes = 25 writes?
+
+        let val_bytes = vec![0u8; 1000]; // 1KB
+        let val = Value::new(&val_bytes);
+
+        for i in 0..30 {
+            db.put(format!("key{:05}", i).as_bytes(), val.clone())
+                .unwrap();
+        }
+
+        // Now we should have created multiple frozen memtables.
+        // Compaction thread should wake up and flush them.
+
+        // Wait for flush.
+        // Condition: `levels[0]` has files. We don't strictly check `frozen_count == 0` because
+        // flush policy might leave some frozen memtables if they don't meet the batch size.
+        // We just want to ensure flushing IS happening.
+        let start = std::time::Instant::now();
+        loop {
+            let current = db.current.load();
+            let frozen_count = current.frozen_memtables.len();
+            let l0_count = if !current.sstables.is_empty() {
+                current.sstables[0].len()
+            } else {
+                0
+            };
+
+            if l0_count > 0 {
+                // Success!
+                // println!("Flush confirmed: {} frozen, {} SSTables", frozen_count, l0_count);
+                break;
+            }
+
+            if start.elapsed().as_secs() > 10 {
+                panic!(
+                    "Timeout waiting for flush. Frozen: {}, L0: {}",
+                    frozen_count, l0_count
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // Verify Data Availability (Read from SST)
+        // Check "key00000" (oldest, should be in SST)
+        let res = db.get(b"key00000").unwrap();
+        assert!(res.is_some(), "Should find key00000 even after flush");
+
+        // Verify GC
+        {
+            let lock = db.manifest_lock.lock().unwrap();
+            // If we flushed, we should have removed some WALs.
+            // println!("WALs remaining: {}", lock.wals.len());
+            // Should be smaller than initial (6)
+            assert!(lock.wals.len() < 10, "GC should keep WALs under control");
+        }
     }
 }

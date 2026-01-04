@@ -80,6 +80,7 @@ pub const SSTABLE_EXTENSION: &str = "sst";
 const MAGIC_NUMBER_BYTES: [u8; 4] = [0x41, 0x42, 0x43, 0x44]; // Example bytes, need to match spec if any
 
 pub struct Sstable {
+    pub id: u32,
     file: File,
     index: Vec<(Key, Key, u64)>,
     #[allow(dead_code)] // Used in search logic
@@ -223,7 +224,13 @@ impl SstableWriter {
         Ok(())
     }
 
-    pub fn finalize(mut self) -> Result<(), DbError> {
+    pub fn current_size(&mut self) -> Result<u64, DbError> {
+        self.file
+            .stream_position()
+            .map_err(|e| DbError::Io(Arc::new(e)))
+    }
+
+    pub fn finalize(mut self) -> Result<crate::data_stores::manifest::FileMetadata, DbError> {
         // Flush any remaining data in the current block
         if !self.current_block.is_empty() {
             self.flush_block()?;
@@ -237,6 +244,11 @@ impl SstableWriter {
         let mut index_data = Vec::new();
 
         // Write: min-key, max-key for sstable
+        // Note: min_key/max_key must exist if we wrote anything.
+        // If empty sstable, they are None.
+        let min_key = self.min_key.clone().unwrap_or(Key::new(&[], 0));
+        let max_key = self.max_key.clone().unwrap_or(Key::new(&[], 0));
+
         if let (Some(min), Some(max)) = (&self.min_key, &self.max_key) {
             min.encode(&mut index_data)
                 .map_err(|e| DbError::Io(Arc::new(e)))?;
@@ -318,12 +330,28 @@ impl SstableWriter {
             .sync_all()
             .map_err(|e| DbError::Io(Arc::new(e)))?;
 
-        Ok(())
+        let file_size = self
+            .file
+            .stream_position()
+            .map_err(|e| DbError::Io(Arc::new(e)))? as u32;
+
+        Ok(crate::data_stores::manifest::FileMetadata {
+            file_id: 0, // Placeholder, caller must set
+            file_size,
+            min_key,
+            max_key,
+        })
     }
 }
 
 impl Sstable {
     pub fn new(path: &std::path::Path) -> Result<Self, DbError> {
+        let id: u32 = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse().ok())
+            .ok_or(DbError::ManifestCorrupted)?; // Should be Sstable ID error
+
         let mut file = File::open(path).map_err(|e| DbError::Io(Arc::new(e)))?;
         let file_len = file.metadata().map_err(|e| DbError::Io(Arc::new(e)))?.len();
 
@@ -382,6 +410,7 @@ impl Sstable {
         }
 
         Ok(Self {
+            id,
             file,
             index,
             bloom_filter,
@@ -473,6 +502,98 @@ impl Sstable {
         }
 
         Ok(None)
+    }
+
+    pub fn min_key(&self) -> &Key {
+        &self.min_key
+    }
+
+    pub fn max_key(&self) -> &Key {
+        &self.max_key
+    }
+}
+
+pub(crate) struct BlockIterator {
+    cursor: std::io::Cursor<Vec<u8>>,
+}
+
+impl BlockIterator {
+    fn new(data: Vec<u8>) -> Self {
+        Self {
+            cursor: std::io::Cursor::new(data),
+        }
+    }
+}
+
+impl Iterator for BlockIterator {
+    type Item = Result<(Key, Value), DbError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor.position() >= self.cursor.get_ref().len() as u64 {
+            return None;
+        }
+
+        let key = match Key::decode(&mut self.cursor) {
+            Ok(k) => k,
+            Err(e) => return Some(Err(e)),
+        };
+
+        let val = match Value::decode(&mut self.cursor) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+
+        Some(Ok((key, val)))
+    }
+}
+
+pub(crate) struct SstableIterator {
+    sstable: Arc<Sstable>,
+    current_block_idx: usize,
+    current_block_iter: Option<BlockIterator>,
+}
+
+impl SstableIterator {
+    pub fn new(sstable: Arc<Sstable>) -> Self {
+        Self {
+            sstable,
+            current_block_idx: 0,
+            current_block_iter: None,
+        }
+    }
+
+    fn ensure_block_loaded(&mut self) -> Result<bool, DbError> {
+        if self.current_block_iter.as_ref().map_or(true, |i| {
+            i.cursor.position() >= i.cursor.get_ref().len() as u64
+        }) {
+            // Need next block
+            if self.current_block_idx >= self.sstable.index.len() {
+                return Ok(false); // EOF
+            }
+
+            let (_, _, offset) = self.sstable.index[self.current_block_idx];
+            let data = Sstable::read_block_with_crc_at(&self.sstable.file, offset)?;
+            self.current_block_iter = Some(BlockIterator::new(data));
+            self.current_block_idx += 1;
+        }
+        Ok(true)
+    }
+}
+
+impl Iterator for SstableIterator {
+    type Item = Result<(Key, Value), DbError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.ensure_block_loaded() {
+            Ok(has_more) => {
+                if !has_more {
+                    return None;
+                }
+            }
+            Err(e) => return Some(Err(e)),
+        }
+
+        self.current_block_iter.as_mut().unwrap().next()
     }
 }
 

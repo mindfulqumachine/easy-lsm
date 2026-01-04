@@ -494,7 +494,7 @@ impl<'a>
         db.write_memtable(self.state.0.reqs.clone(), self.state.2)?;
 
         // Check if memtable is full and needs rotation.
-        if db.active_memtable_size() >= crate::MAX_MEMTABLE_SIZE {
+        if db.active_memtable_size() >= db.max_memtable_size {
             db.rotate_memtable().map_err(|e| {
                 // If rotation fails, we should probably log it but not fail the write request itself
                 // because the write request succeeded (in WAL and Memtable).
